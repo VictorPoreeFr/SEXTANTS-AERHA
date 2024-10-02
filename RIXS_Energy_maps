@@ -1,0 +1,201 @@
+%matplotlib notebook
+import h5py 
+import sys
+import scipy
+import numpy as np
+from numpy import polyfit,polyval #,arange
+from PIL import Image
+import re
+import time
+import os
+from joblib import Parallel, delayed
+import matplotlib.pyplot as plt
+import matplotlib.colors as pltc
+from scipy.optimize import curve_fit
+from scipy import signal
+from scipy.ndimage import shift
+from scipy.ndimage import geometric_transform
+import glob
+import copy
+import matplotlib.colors as colors
+
+# Define quick Gaussian function with background
+# =========
+def gausswbg(x,a,x0,sig,bg):
+    return a/(sig*1.0)*np.sqrt(2*np.pi)*np.exp(-1/(2.0)*(x-x0)**2/(sig**2))+bg
+
+def gauss(x,a,x0,sig):
+    return a/(sig*1.0)*np.sqrt(2*np.pi)*np.exp(-1/(2.0)*(x-x0)**2/(sig**2))
+# =========
+
+def norm_XAS(E,I,subpoints = 8,scalepoints = 8):
+    I_temp = I - np.nanmean(I[:subpoints])
+    I_f = I_temp / np.nanmean(I_temp[-scalepoints:])
+    return E, I_f
+
+def rebin(x,y,binsize):
+    if len(x)%binsize != 0:
+        tempx = x[:-(len(x)%binsize)]
+        tempy = y[:-(len(x)%binsize)]
+    else:
+        tempx = x
+        tempy = y
+
+    tempnewx = tempx.reshape((len(tempx)//binsize,binsize))
+    newx = np.nanmean(tempnewx,axis=1)
+
+    tempnewy = tempy.reshape((len(tempx)//binsize,binsize))
+    newy = np.nanmean(tempnewy,axis=1)
+
+    return newx,newy
+
+def get_n_XAS(fullname,subpoints = 8,scalepoints = 8):
+    XAS=rixs.rixs_image(fullname)
+    E=XAS.data[:,0]
+    I=XAS.data[:,2]
+    # normalisation step
+    I_temp = I - np.nanmean(I[:subpoints])
+    I_f = I_temp / np.nanmean(I_temp[-scalepoints:])
+    return E, I_f
+
+
+folder_data_path = "Folder_data_path"
+reduction_folder = "Reduction_folder"
+
+CurvatureFile = reduction_folder + "/Curvature_RIXS_.txt"
+DispersionFile = reduction_folder + "/Dispersion_RIXS_.txt"
+
+Disp = np.genfromtxt(DispersionFile)
+E_out = polyval(Disp,np.arange(4056))
+
+    
+    
+def saveSpectrum(Spectrum,spectrumName, E_out = None, E_loss = None):
+    # write a columns text file conainaing pixels or E_out or E_loss and intensities ;
+    if not E_out is None:
+        xarray = E_out
+    elif not E_loss is None:
+        xarray = E_loss
+    else:
+        xarray = np.arange(len(Spectrum))
+
+    yarray = Spectrum
+    data = np.column_stack([xarray, yarray])
+    np.savetxt(spectrumName , data, fmt=['%.2f','%.2f'])
+    
+def findShift(Spectrum1, Spectrum2):
+    """
+    Function to find a small shift in between to very similar spectra.
+
+    Parameters
+    ----------
+    Spectrum1 : Array of floats.
+        First spectrum.
+    Spectrum2 : Array of floats.
+        Second spectum.
+
+    Returns
+    -------
+    idx_shift : Integer
+        Number of bins to shift to have maximum overlap of both spectra.
+
+    """
+    idx_shift = np.argmax(signal.correlate(Spectrum1, Spectrum2)) - len(Spectrum2)+1 #-np.nanmin(Spectrum1) -np.nanmin(Spectrum2)
+    return idx_shift
+
+def shiftSpectrum(ObsElastiEnergy, EnergyMono, EnergyOut, Spectrum):
+    """
+    The function is used to shift the spectrum to align the 
+    observed elastic line to its nominal value, therefor assuring an 
+    elastic line at zero energy loss.
+
+    Parameters
+    ----------
+    ObsElastiEnergy : float
+        Observed energy of the elastic line.
+    EnergyMono : Float.
+        Nominal incident energy given by the monochromator.
+    EnergyOut : array of floats.
+        List of outgoing energies of the spectrum to shift.
+    Spectrum : array of floats.
+        List of intensities of the spectrum.
+        
+    Returns
+    -------
+    shifted_rixs : array of floats.
+        List of spectrum intensities after shifting.
+
+    Created 23.02.2023 Victor
+    """
+    idx_ElasE = np.nanargmin(np.abs(EnergyOut - ObsElastiEnergy)) # find location/index of the observed elastic peak 
+    idx_Emono = np.nanargmin(np.abs(EnergyOut - EnergyMono)) # same for the energy of the mono ;
+    idx_shift = idx_Emono - idx_ElasE  # number of points to shift
+    shifted_rixs = shift(Spectrum, idx_shift, cval=np.min(Spectrum)) # shifting
+    return shifted_rixs 
+
+def getSpectrumhdf5(fname):
+    File = h5py.File(fname)
+
+    histogram = np.array(File.get('Histogram'))
+    histogramCorrected = np.array(File.get('HistogramCorrected'))
+    return [histogram,histogramCorrected]
+
+
+F = glob.glob(folder_data_path+'data_*.hdf5')
+F.sort(key=lambda f: int(re.sub('\D', '', f.split('/')[-1])))
+# print(F)     # Use this one to check the content inside the folder.
+Es = np.linspace(515,530,90) # list of incident energies It could be energies, positions or even just number of scans.
+binsize = 3 # if you want to bin your data
+bounds = 10 # boundaries of the fit used to re-align the spectra
+
+p = 0
+MAP_LT = [] # initializing raw map
+MAP_LT_c = [] #initializing smoothed map
+Epix = np.linspace(0,4056,4056)
+
+fig, ax = plt.subplots(1,3,figsize=[12,7],sharex=False,sharey=False)        
+
+for idxf, f in enumerate(F):   # make sure the length of the list matches waht you want to plot.
+    try:
+        Spec = getSpectrumhdf5(f)
+        E,S = rebin(E_out,Spec[1],binsize)
+        try:
+#             # attempts to fit in order to align the spectrum
+#             popt, cov = curve_fit(gauss, E[np.argmin(np.abs(E-Es[idxf]))-bounds:np.argmin(np.abs(E-Es[idxf]))+bounds],
+#                                   S[np.argmin(np.abs(E-Es[idxf]))-bounds:np.argmin(np.abs(E-Es[idxf]))+bounds],
+#                                   p0=[np.nanmax(S[np.argmin(np.abs(E-Es[idxf]))-bounds:np.argmin(np.abs(E-Es[idxf]))+bounds]),
+#                                       Es[idxf],8])
+# #             print(popt[1]-Es[idxf])
+#             newS = shiftSpectrum(popt[1], Es[idxf], E, S)
+            MAP_LT.append(S)
+            newScleaned = scipy.signal.medfilt(S,kernel_size=5) # does some smoothing
+            MAP_LT_c.append(newScleaned)
+            
+            
+        except:
+            print('Could not fit spectrum : '+f.split('/')[-1])
+            MAP_LT.append(S)
+            MAP_LT_c.append(scipy.signal.medfilt(S,kernel_size=5))  # does some smoothing
+        
+        p += 1
+        
+        ax[1].plot(S + idxf*6000)
+        
+    except:
+        print('Last file not ready')
+
+x = Es[:p]
+X,Y = np.meshgrid(x,E)
+ax[0].pcolormesh(Y.T,X.T,np.array(MAP_LT),vmin = 0, vmax=11000,cmap='viridis')
+ax[0].set_ylabel('$E_{in}$ (eV)')
+ax[0].set_xlabel('$E_{out}$ (eV)')
+ax[0].set_title('O K edge map')
+
+TFY_1 = np.array(MAP_LT).sum(axis=1)
+scale = np.nanmax(TFY_1)
+ax[2].plot(x, TFY_1,'k',label='Integrated')
+ax[2].set_xlabel('$E_{in}$ (eV)')
+ax[2].set_ylabel('Intensity (arb. u.)')
+ax[2].set_title('TFY')
+
+plt.tight_layout()
