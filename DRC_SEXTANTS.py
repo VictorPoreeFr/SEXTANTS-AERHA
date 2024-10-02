@@ -9,9 +9,6 @@ from scipy.optimize import curve_fit,minimize
 import matplotlib.pyplot as plt
 from matplotlib.pylab import subplots,Figure  #close,
 import matplotlib.colors as colors
-#import tkinter as Tk
-#import colorama
-# from colorama import Fore, Style
 #from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg,NavigationToolbar2Tk #Agg
 from scipy import signal
 from scipy.ndimage import shift
