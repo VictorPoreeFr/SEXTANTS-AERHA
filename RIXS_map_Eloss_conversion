@@ -1,0 +1,242 @@
+"""
+Created on Tue Feb  7 19:35:21 2023
+
+@author: victor
+"""
+import h5py 
+%matplotlib notebook
+import sys
+import scipy
+
+import numpy as np
+from numpy import polyfit,polyval #,arange
+from PIL import Image
+import re
+import time
+import os
+from joblib import Parallel, delayed
+import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit
+from scipy import signal
+from scipy.ndimage import shift
+from scipy.ndimage import geometric_transform
+import glob
+import copy
+import matplotlib.colors as colors
+
+# Define quick Gaussian function with background
+# =========
+def gausswbg(x,a,x0,sig,bg):
+    return a/(sig*1.0)*np.sqrt(2*np.pi)*np.exp(-1/(2.0)*(x-x0)**2/(sig**2))+bg
+# =========
+
+def norm_XAS(E,I,subpoints = 8,scalepoints = 8):
+    I_temp = I - np.nanmean(I[:subpoints])
+    I_f = I_temp / np.nanmean(I_temp[-scalepoints:])
+    return E, I_f
+
+def rebin(x,y,binsize):
+    if len(x)%binsize != 0:
+        tempx = x[:-(len(x)%binsize)]
+        tempy = y[:-(len(x)%binsize)]
+    else:
+        tempx = x
+        tempy = y
+
+    tempnewx = tempx.reshape((len(tempx)//binsize,binsize))
+    newx = np.nanmean(tempnewx,axis=1)
+
+    tempnewy = tempy.reshape((len(tempx)//binsize,binsize))
+    newy = np.nanmean(tempnewy,axis=1)
+
+    return newx,newy
+
+
+from IPython.display import display, HTML
+display(HTML("<style>.container { width:95% !important; }</style>"))
+
+folder_data_path = "data_folder"
+reduction_folder = "reduction_folder"
+
+CurvatureFile = reduction_folder + "/Curvature_RIXS.txt"
+DispersionFile = reduction_folder + "/Dispersion_RIXS.txt"
+
+Disp = np.genfromtxt(DispersionFile)
+E_out = polyval(Disp,np.arange(4056))
+
+    
+def saveSpectrum(Spectrum,spectrumName, E_out = None, E_loss = None):
+    # write a columns text file conainaing pixels or E_out or E_loss and intensities ;
+    if not E_out is None:
+        xarray = E_out
+    elif not E_loss is None:
+        xarray = E_loss
+    else:
+        xarray = np.arange(len(Spectrum))
+
+    yarray = Spectrum
+    data = np.column_stack([xarray, yarray])
+    np.savetxt(spectrumName , data, fmt=['%.2f','%.2f'])
+    
+def findShift(Spectrum1, Spectrum2):
+    """
+    Function to find a small shift in between to very similar spectra.
+
+    Parameters
+    ----------
+    Spectrum1 : Array of floats.
+        First spectrum.
+    Spectrum2 : Array of floats.
+        Second spectum.
+
+    Returns
+    -------
+    idx_shift : Integer
+        Number of bins to shift to have maximum overlap of both spectra.
+
+    """
+    idx_shift = np.argmax(signal.correlate(Spectrum1, Spectrum2)) - len(Spectrum2)+1 #-np.nanmin(Spectrum1) -np.nanmin(Spectrum2)
+    return idx_shift
+
+def shiftSpectrum(ObsElastiEnergy, EnergyMono, EnergyOut, Spectrum):
+    """
+    The function is used to shift the spectrum to align the 
+    observed elastic line to its nominal value, therefor assuring an 
+    elastic line at zero energy loss.
+
+    Parameters
+    ----------
+    ObsElastiEnergy : float
+        Observed energy of the elastic line.
+    EnergyMono : Float.
+        Nominal incident energy given by the monochromator.
+    EnergyOut : array of floats.
+        List of outgoing energies of the spectrum to shift.
+    Spectrum : array of floats.
+        List of intensities of the spectrum.
+        
+    Returns
+    -------
+    shifted_rixs : array of floats.
+        List of spectrum intensities after shifting.
+
+    Created 23.02.2023 Victor
+    """
+    idx_ElasE = np.nanargmin(np.abs(EnergyOut - ObsElastiEnergy)) # find location/index of the observed elastic peak 
+    idx_Emono = np.nanargmin(np.abs(EnergyOut - EnergyMono)) # same for the energy of the mono ;
+    idx_shift = idx_Emono - idx_ElasE  # number of points to shift
+    shifted_rixs = shift(Spectrum, idx_shift, cval=np.min(Spectrum)) # shifting
+    return shifted_rixs 
+
+def getSpectrumhdf5(fname):
+    File = h5py.File(fname)
+
+    histogram = np.array(File.get('Histogram'))
+    histogramCorrected = np.array(File.get('HistogramCorrected'))
+    return [histogram,histogramCorrected]
+
+# ================= Initial visualisation of energy map =====
+F = glob.glob(folder_data_path+/Histogrames*')
+F.sort(key=lambda f: int(re.sub('\D', '', f.split('/')[-1])))
+    
+Map = []
+
+Ei = np.arange(703,732.25,0.25) # list incident energies
+X,Y = np.meshgrid(Ei, E_out)
+
+for f in F:    
+#     print(f.split('/')[-1])
+    try:
+        Spec = getSpectrumhdf5(f)
+        Map.append(Spec[1])
+    except:
+        print('Last file not ready yet')
+
+
+fig, ax = plt.subplots(1,2,figsize=[12,5])
+ax[0].set_title('FeTaS2 CL energy map grazing')
+ax[0].pcolormesh(Y.T,X.T,np.array(Map),vmin=0,vmax=100000)
+ax[0].set_xlabel('$E_{out}$ (ev)')
+ax[0].set_ylabel('$E_{in}$ (eV)')
+
+ax[1].plot(Ei,np.array(Map).sum(axis=1))
+ax[1].set_xlabel('$E_{in}$ (eV)')
+ax[1].set_ylabel('Intensity (arb. u.)')
+ax[1].set_title('XAS TFY')
+
+# ================= Conversion to energy loss and re-alignement =====
+
+Ei = np.arange(703,732.25,0.25)
+binsize = np.mean(E_out[:-1]-E_out[1:])
+# print(len(Es))
+List_E_loss = []
+for idx in np.arange(len(Map)):
+    List_E_loss.append( - (E_out-Ei[idx]))
+    
+# print(List_E_loss)
+
+M = int(np.max(List_E_loss)) # max energy loss
+m = int(np.min(List_E_loss)) # Min energy low (gain here) to be plotted
+n_bins = int((M-m)/binsize)+1 # Number of bins to interpolate the data ;
+bins = np.linspace(m,M,n_bins) # new energy loss bins ;
+
+MAP_loss = np.zeros((np.size(Ei),n_bins)) # initialize RIXS map
+MAP_loss[:] = np.nan
+
+for idx, S in enumerate(Map): # loop on spectra 
+    tmp_E_loss = List_E_loss[idx]
+    tmp_max = int(np.max(tmp_E_loss)) # get max energy loss
+    tmp_n_bins = int((tmp_max-m)/binsize)+1 # associated number of bins
+    tmp_bins = np.linspace(m,tmp_max,tmp_n_bins) # and associated new bins
+    MAP_loss[idx,0:tmp_n_bins] = np.interp(tmp_bins,tmp_E_loss,S) # intepolate the RIXS for new bins and store it in the map;
+
+MAP_loss -= np.nanmin(MAP_loss) # subtract 'background' of the Map 
+
+MAP_loss_corr = copy.deepcopy(MAP_loss[:])
+T =np.argmin(np.abs(bins))
+for idx, l in enumerate(MAP_loss):
+#     print(l[X-40:X+10])
+    try:
+        parameters, cov = curve_fit(gausswbg,bins[T+20:T+100], l[T+20:T+100], p0 = [5000,2.,1,100])
+#         print(parameters[1])
+        if np.abs(parameters[1]) < 4: # this threshold has to be addapted to each case
+            shift = parameters[1]
+
+        tmp_rixs = np.interp(bins+shift,bins,l)
+        MAP_loss_corr[idx] = tmp_rixs
+    except:
+        print(idx)
+
+X, Y = np.meshgrid(Ei, bins) # prepare mesh for plot ;
+X2 = X
+Y2 = Y
+
+fig, axs = plt.subplots(1, 1,sharex=True,figsize=[10,6]) #sharex=True, sharey=True
+
+axs.pcolormesh(Y,X, MAP_loss_corr.T,norm=colors.Normalize(vmin=(np.nanmin(MAP_loss_corr)), vmax=np.nanmax(MAP_loss_corr)/2),linewidth=0,cmap='viridis', shading='auto', edgecolors=None)
+
+axs.set_xlabel('$E_{loss}$ (eV)')
+axs.set_ylabel("$E_{in}$ (eV)")
+axs.set_xlim([-2, M])
+# fig.colorbar(im,ax = axs)
+axs.set_title("MAP Eloss") ;
+
+
+fig2, axs2 = plt.subplots(1, 1,sharex=True,figsize=[10,6]) #sharex=True, sharey=True
+
+# cols = plt.cm(len(MAP_loss_corr))
+Spec = 0
+for ids, s in enumerate(MAP_loss_corr):
+    Spec += s
+#     print(ids%2)
+    if ids % 2 & ids != 0:
+        axs2.plot(bins,Spec+2000*ids,'k')
+        Spec = 0
+axs2.set_xlabel('$E_{loss}$ (eV)',fontsize = 14)
+axs2.set_ylabel("Intensity (arb. u.)",fontsize = 14)
+axs2.set_yticks([])
+axs2.set_xlim([-2, 15])
+axs2.tick_params(axis='x', labelsize=14)
+axs2.tick_params(axis='y', labelsize=14)
+# fig.colorbar(im,ax = axs)
+axs2.set_title("Stack Eloss") ;
